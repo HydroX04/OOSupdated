@@ -97,6 +97,7 @@ class UpdatePaymentDetails(BaseModel):
     delivery_fee: float
     total_amount: float
     delivery_notes: Optional[str] = None
+
 @router.get("/admin/orders/manage")
 async def get_all_orders(token: str = Depends(oauth2_scheme)):
     await validate_token_and_roles(token, ["admin", "staff"])
@@ -113,36 +114,68 @@ async def get_all_orders(token: str = Depends(oauth2_scheme)):
                 o.OrderType,
                 o.PaymentMethod,
                 o.TotalAmount,
+                o.DeliveryNotes,
                 o.Status,
-                STRING_AGG(CONCAT(oi.ProductName, ' (x', CAST(oi.Quantity AS VARCHAR), ')'), ', ') AS Items
+
+                di.EmailAddress,
+                di.PhoneNumber,
+                di.Address,
+                di.City,
+                di.Province,
+                di.Landmark
+
             FROM Orders o
-            LEFT JOIN OrderItems oi ON o.OrderID = oi.OrderID
-            GROUP BY o.OrderID, o.UserName, o.OrderDate, o.OrderType, o.PaymentMethod, o.TotalAmount, o.Status
+                LEFT JOIN DeliveryInfo di ON di.FirstName = o.UserName
             ORDER BY o.OrderDate DESC
         """)
 
-        rows = await cursor.fetchall()
+        orders_data = await cursor.fetchall()
+
+        orders = []
+        for row in orders_data:
+            order_id = row[0]
+
+            # Get item details with price
+            await cursor.execute("""
+                SELECT ProductName, Quantity, Price 
+                FROM OrderItems 
+                WHERE OrderID = ?
+            """, (order_id,))
+            item_rows = await cursor.fetchall()
+
+            item_list = []
+            for item in item_rows:
+                item_list.append({
+                    "name": item[0],
+                    "quantity": item[1],
+                    "price": float(item[2])
+                })
+
+            delivery_address = ", ".join(filter(None, [row[10], row[11], row[12], row[13]]))
+
+            orders.append({
+                "order_id": row[0],
+                "customer_name": row[1],
+                "order_date": row[2].strftime("%Y-%m-%d %H:%M:%S"),
+                "order_type": row[3],
+                "payment_method": row[4],
+                "total_amount": float(row[5]),
+                "deliveryNotes": row[6],
+                "order_status": row[7],
+                "emailAddress": row[8],
+                "phoneNumber": row[9],
+                "deliveryAddress": delivery_address,
+                "items": item_list
+            })
+
+        return orders
+
     except Exception as e:
         logger.error(f"Failed to fetch orders: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to retrieve orders")
     finally:
         await cursor.close()
         await conn.close()
-
-    orders = []
-    for row in rows:
-        orders.append({
-            "order_id": row[0],
-            "customer_name": row[1],
-            "order_date": row[2].strftime("%Y-%m-%d %H:%M:%S"),
-            "order_type": row[3],
-            "payment_method": row[4],
-            "total_amount": float(row[5]),
-            "order_status": row[6],
-            "items": row[7] if row[7] else ""
-        })
-
-    return orders
 
 @router.get("/admin/orders/today_count")
 async def get_todays_orders_count(token: str = Depends(oauth2_scheme)):
@@ -211,7 +244,7 @@ async def get_all_pending_orders(token: str = Depends(oauth2_scheme)):
 
     return orders
 
-@router.get("/cart/admin/orders/pending")
+@router.get("cart/admin/orders/pending")
 async def get_pending_orders_count(token: str = Depends(oauth2_scheme)):
     await validate_token_and_roles(token, ["admin", "staff"])
     conn = await get_db_connection()
