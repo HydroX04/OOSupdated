@@ -115,7 +115,7 @@ const Dashboard = () => {
       return;
     }
 
-    fetch("http://localhost:7004/cart/admin/orders/manage", {
+    fetch("http://localhost:7004/cart/admin/orders/pending", {
       headers: {
         Authorization: `Bearer ${authToken}`,
       },

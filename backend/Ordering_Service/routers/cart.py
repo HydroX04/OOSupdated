@@ -163,6 +163,68 @@ async def get_todays_orders_count(token: str = Depends(oauth2_scheme)):
         await conn.close()
     return {"todays_orders": count}
 
+@router.get("/admin/orders/pending")
+async def get_all_pending_orders(token: str = Depends(oauth2_scheme)):
+    await validate_token_and_roles(token, ["admin", "staff"])
+
+    conn = await get_db_connection()
+    cursor = await conn.cursor()
+
+    try:
+        await cursor.execute("""
+            SELECT 
+                o.OrderID,
+                o.UserName,
+                o.OrderDate,
+                o.OrderType,
+                o.PaymentMethod,
+                o.TotalAmount,
+                o.Status,
+                STRING_AGG(CONCAT(oi.ProductName, ' (x', CAST(oi.Quantity AS VARCHAR), ')'), ', ') AS Items
+            FROM Orders o
+            LEFT JOIN OrderItems oi ON o.OrderID = oi.OrderID
+            WHERE o.Status = 'Pending'
+            GROUP BY o.OrderID, o.UserName, o.OrderDate, o.OrderType, o.PaymentMethod, o.TotalAmount, o.Status
+            ORDER BY o.OrderDate DESC
+        """)
+
+        rows = await cursor.fetchall()
+    except Exception as e:
+        logger.error(f"Failed to fetch pending orders: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to retrieve pending orders")
+    finally:
+        await cursor.close()
+        await conn.close()
+
+    orders = []
+    for row in rows:
+        orders.append({
+            "order_id": row[0],
+            "customer_name": row[1],
+            "order_date": row[2].strftime("%Y-%m-%d %H:%M:%S"),
+            "order_type": row[3],
+            "payment_method": row[4],
+            "total_amount": float(row[5]),
+            "order_status": row[6],
+            "items": row[7] if row[7] else ""
+        })
+
+    return orders
+
+@router.get("/cart/admin/orders/pending")
+async def get_pending_orders_count(token: str = Depends(oauth2_scheme)):
+    await validate_token_and_roles(token, ["admin", "staff"])
+    conn = await get_db_connection()
+    cursor = await conn.cursor()
+    try:
+        await cursor.execute("SELECT COUNT(*) FROM Orders WHERE Status = 'Pending'")
+        result = await cursor.fetchone()
+        pending_count = result[0] if result else 0
+    finally:
+        await cursor.close()
+        await conn.close()
+    return {"pending_orders_count": pending_count}
+
 @router.get("/orders/history")
 async def get_user_orders(token: str = Depends(oauth2_scheme)):
     username = await validate_token_and_roles(token, ["user"])
