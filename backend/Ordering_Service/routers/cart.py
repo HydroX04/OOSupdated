@@ -69,6 +69,62 @@ class DeliveryInfoRequest(BaseModel):
     PhoneNumber: str
     Notes: Optional[str] = None
 
+class FinalizeOrderRequest(BaseModel):
+    username: str
+    notes: Optional[str] = None
+
+class UpdatePaymentDetails(BaseModel):
+    username: str
+    payment_method: str
+    subtotal: float
+    delivery_fee: float
+    total_amount: float
+    delivery_notes: Optional[str] = None
+
+@router.put("/update-payment")
+async def update_payment_details(payload: UpdatePaymentDetails, token: str = Depends(oauth2_scheme)):
+    await validate_token_and_roles(token, ["user", "admin", "staff"])
+
+    conn = await get_db_connection()
+    cursor = await conn.cursor()
+    try:
+        await cursor.execute("""
+            SELECT OrderID FROM Orders
+            WHERE UserName = ? AND Status = 'Pending' AND PaymentStatus = 'Paid'
+            ORDER BY OrderDate DESC
+            OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY
+        """, (payload.username,))
+        order = await cursor.fetchone()
+
+        if not order:
+            raise HTTPException(status_code=404, detail="No paid order found to update")
+
+        order_id = order[0]
+
+        await cursor.execute("""
+            UPDATE Orders
+            SET PaymentMethod = ?, Subtotal = ?, DeliveryFee = ?, TotalAmount = ?, DeliveryNotes = ?
+            WHERE OrderID = ?
+        """, (
+            payload.payment_method,
+            payload.subtotal,
+            payload.delivery_fee,
+            payload.total_amount,
+            payload.delivery_notes or '',
+            order_id
+        ))
+
+        await conn.commit()
+    except Exception as e:
+        logger.error(f"Error updating order payment details: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to update order payment details")
+    finally:
+        await cursor.close()
+        await conn.close()
+
+    return {"message": "Order payment details updated successfully"}
+
+
 
 @router.post("/deliveryinfo", status_code=status.HTTP_201_CREATED)
 async def add_delivery_info(delivery_info: DeliveryInfoRequest, token: str = Depends(oauth2_scheme)):
@@ -111,7 +167,7 @@ async def get_cart(username: str, token: str = Depends(oauth2_scheme)):
     await cursor.execute("""
         SELECT OrderID, OrderDate, Status
         FROM Orders
-        WHERE UserName = ? AND Status = 'Pending'
+        WHERE UserName = ? AND Status = 'Pending' AND PaymentStatus = 'Unpaid'
         ORDER BY OrderDate DESC
         OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY
     """, (username,))
@@ -156,10 +212,11 @@ async def add_to_cart(item: CartItem, token: str = Depends(oauth2_scheme)):
     conn = await get_db_connection()
     cursor = await conn.cursor()
     try:
+        # Look for unpaid & pending order
         await cursor.execute("""
             SELECT OrderID
             FROM Orders
-            WHERE UserName = ? AND Status = 'Pending'
+            WHERE UserName = ? AND Status = 'Pending' AND PaymentStatus = 'Unpaid'
             ORDER BY OrderDate DESC
             OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY
         """, (item.username,))
@@ -169,18 +226,24 @@ async def add_to_cart(item: CartItem, token: str = Depends(oauth2_scheme)):
             order_id = order[0]
         else:
             await cursor.execute("""
-                INSERT INTO Orders (UserName, OrderType, PaymentMethod, Subtotal, DeliveryFee, TotalAmount, DeliveryNotes, Status)
+                INSERT INTO Orders (
+                    UserName, OrderType, PaymentMethod, Subtotal, DeliveryFee,
+                    TotalAmount, DeliveryNotes, Status, PaymentStatus
+                )
                 OUTPUT INSERTED.OrderID
-                VALUES (?, ?, ?, 0, 0, 0, '', 'Pending')
+                VALUES (?, ?, ?, 0, 0, 0, '', 'Pending', 'Unpaid')
             """, (item.username, item.order_type, 'Cash'))
             row = await cursor.fetchone()
             order_id = row[0] if row else None
 
+        # Check if item already in cart
         await cursor.execute("""
             SELECT OrderItemID, Quantity FROM OrderItems
             WHERE OrderID = ? AND ProductName = ? AND ProductType = ? AND ProductCategory = ?
-        """, (order_id, item.product_name, item.product_type or '', item.product_category or ''))
-
+        """, (
+            order_id, item.product_name,
+            item.product_type or '', item.product_category or ''
+        ))
         existing_item = await cursor.fetchone()
 
         if existing_item:
@@ -257,27 +320,29 @@ async def remove_from_cart(order_item_id: int, token: str = Depends(oauth2_schem
     return {"message": "Item removed from cart"}
 
 
-@router.post("/cart/finalize", status_code=status.HTTP_200_OK)
+@router.post("/finalize", status_code=status.HTTP_200_OK)
 async def finalize_order(username: str, token: str = Depends(oauth2_scheme)):
     await validate_token_and_roles(token, ["user", "admin", "staff"])
     conn = await get_db_connection()
     cursor = await conn.cursor()
     try:
+        # Select only unpaid orders
         await cursor.execute("""
             SELECT OrderID FROM Orders
-            WHERE UserName = ? AND Status = 'Pending'
+            WHERE UserName = ? AND Status = 'Pending' AND PaymentStatus = 'Unpaid'
             ORDER BY OrderDate DESC
             OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY
         """, (username,))
         order = await cursor.fetchone()
         if not order:
-            raise HTTPException(status_code=404, detail="No pending order found")
+            raise HTTPException(status_code=404, detail="No pending unpaid order found")
 
         order_id = order[0]
 
+        # Finalize by setting PaymentStatus to Paid
         await cursor.execute("""
             UPDATE Orders
-            SET Status = 'Pending'
+            SET PaymentStatus = 'Paid'
             WHERE OrderID = ?
         """, (order_id,))
         await conn.commit()
@@ -288,4 +353,4 @@ async def finalize_order(username: str, token: str = Depends(oauth2_scheme)):
         await cursor.close()
         await conn.close()
 
-    return {"message": "Order finalized successfully"}
+    return {"message": "Order finalized and marked as Paid"}
