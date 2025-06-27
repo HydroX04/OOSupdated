@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, date
 from database import get_db_connection
 import httpx
 import logging
@@ -31,6 +31,23 @@ async def validate_token_and_roles(token: str, allowed_roles: List[str]):
     user_data = response.json()
     if user_data.get("userRole") not in allowed_roles:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
+    
+    return user_data.get("username")
+
+@router.get("/admin/orders/total")
+async def get_total_orders(token: str = Depends(oauth2_scheme)):
+    await validate_token_and_roles(token, ["admin", "staff"])
+    conn = await get_db_connection()
+    cursor = await conn.cursor()
+    try:
+        await cursor.execute("SELECT COUNT(*) FROM Orders")
+        result = await cursor.fetchone()
+        total_orders = result[0] if result else 0
+    finally:
+        await cursor.close()
+        await conn.close()
+    return {"total_orders": total_orders}
+
 
 
 class CartItem(BaseModel):
@@ -80,6 +97,109 @@ class UpdatePaymentDetails(BaseModel):
     delivery_fee: float
     total_amount: float
     delivery_notes: Optional[str] = None
+@router.get("/admin/orders/manage")
+async def get_all_orders(token: str = Depends(oauth2_scheme)):
+    await validate_token_and_roles(token, ["admin", "staff"])
+
+    conn = await get_db_connection()
+    cursor = await conn.cursor()
+
+    try:
+        await cursor.execute("""
+            SELECT 
+                o.OrderID,
+                o.UserName,
+                o.OrderDate,
+                o.OrderType,
+                o.PaymentMethod,
+                o.TotalAmount,
+                o.Status,
+                STRING_AGG(CONCAT(oi.ProductName, ' (x', CAST(oi.Quantity AS VARCHAR), ')'), ', ') AS Items
+            FROM Orders o
+            LEFT JOIN OrderItems oi ON o.OrderID = oi.OrderID
+            GROUP BY o.OrderID, o.UserName, o.OrderDate, o.OrderType, o.PaymentMethod, o.TotalAmount, o.Status
+            ORDER BY o.OrderDate DESC
+        """)
+
+        rows = await cursor.fetchall()
+    except Exception as e:
+        logger.error(f"Failed to fetch orders: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to retrieve orders")
+    finally:
+        await cursor.close()
+        await conn.close()
+
+    orders = []
+    for row in rows:
+        orders.append({
+            "order_id": row[0],
+            "customer_name": row[1],
+            "order_date": row[2].strftime("%Y-%m-%d %H:%M:%S"),
+            "order_type": row[3],
+            "payment_method": row[4],
+            "total_amount": float(row[5]),
+            "order_status": row[6],
+            "items": row[7] if row[7] else ""
+        })
+
+    return orders
+
+@router.get("/admin/orders/today_count")
+async def get_todays_orders_count(token: str = Depends(oauth2_scheme)):
+    await validate_token_and_roles(token, ["admin", "staff"])
+    conn = await get_db_connection()
+    cursor = await conn.cursor()
+    try:
+        today_str = date.today().strftime("%Y-%m-%d")
+        await cursor.execute("""
+            SELECT COUNT(*)
+            FROM Orders
+            WHERE CONVERT(date, OrderDate) = ?
+        """, (today_str,))
+        result = await cursor.fetchone()
+        count = result[0] if result else 0
+    finally:
+        await cursor.close()
+        await conn.close()
+    return {"todays_orders": count}
+
+@router.get("/orders/history")
+async def get_user_orders(token: str = Depends(oauth2_scheme)):
+    username = await validate_token_and_roles(token, ["user"])
+    conn = await get_db_connection()
+    cursor = await conn.cursor()
+
+    await cursor.execute("""
+        SELECT o.OrderID, o.OrderDate, o.OrderType, o.Status, oi.ProductName, oi.Quantity, oi.Price
+        FROM Orders o
+        JOIN OrderItems oi ON o.OrderID = oi.OrderID
+        WHERE o.UserName = ?
+        ORDER BY o.OrderDate DESC
+    """, (username,))
+
+    rows = await cursor.fetchall()
+    await cursor.close()
+    await conn.close()
+
+    # Structure the data by order
+    orders = {}
+    for row in rows:
+        order_id = row[0]
+        if order_id not in orders:
+            orders[order_id] = {
+                "id": order_id,
+                "date": row[1],
+                "orderType": row[2],
+                "status": row[3],
+                "products": [],
+            }
+        orders[order_id]["products"].append({
+            "name": row[4],
+            "quantity": row[5],
+            "price": float(row[6])
+        })
+
+    return list(orders.values())
 
 @router.put("/update-payment")
 async def update_payment_details(payload: UpdatePaymentDetails, token: str = Depends(oauth2_scheme)):
